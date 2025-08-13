@@ -2,6 +2,7 @@ from flask.views import MethodView
 from flask_smorest import Blueprint
 from flask import request, jsonify, current_app, g
 from src.utils.auth import verify_supabase_token
+from src.config.plans import get_plan, is_valid_plan
 from supabase import create_client, Client
 from decimal import Decimal, ROUND_HALF_UP
 import os
@@ -72,6 +73,34 @@ def _create_paytr_token(params: dict) -> dict:
     return data
 
 
+@blp.route('/payments/plans')
+class GetPlans(MethodView):
+    def get(self):
+        """
+        Get available plans information.
+        Returns plan details that can be safely displayed on the frontend.
+        """
+        from src.config.plans import get_all_plans
+        
+        plans = get_all_plans()
+        
+        # Return only the information safe for frontend display
+        safe_plans = {}
+        for plan_id, plan in plans.items():
+            safe_plans[plan_id] = {
+                'id': plan['id'],
+                'name': plan['name'],
+                'price': plan['price'],
+                'currency': plan['currency'],
+                'description': plan['description'],
+                'features': plan['features']
+            }
+        
+        return jsonify({
+            'plans': safe_plans
+        }), 200
+
+
 @blp.route('/payments/paytr/session')
 class CreatePaytrSession(MethodView):
     @verify_supabase_token
@@ -80,7 +109,7 @@ class CreatePaytrSession(MethodView):
         Create PayTR payment session and persist an order in Supabase.
         Request JSON:
         {
-          "items": [{"name": "Pro Plan", "price": "9.99", "quantity": 1}],
+          "plan_id": "pro_plan",  # Only "pro_plan" is supported
           "customer": {"email": str, "name": str, "address": str, "phone": str},
           "no_installment": 0|1 (optional),
           "max_installment": number (optional),
@@ -89,9 +118,20 @@ class CreatePaytrSession(MethodView):
         """
         body = request.get_json() or {}
 
-        items = body.get('items') or []
-        if not items:
-            return jsonify({ 'error': 'items is required' }), 400
+        plan_id = body.get('plan_id')
+        if not plan_id:
+            return jsonify({ 'error': 'plan_id is required' }), 400
+
+        if not is_valid_plan(plan_id):
+            return jsonify({ 'error': 'Invalid plan_id' }), 400
+
+        # Get plan details from configuration
+        plan = get_plan(plan_id)
+        items = [{
+            'name': plan['name'],
+            'price': plan['price'],
+            'quantity': plan['quantity']
+        }]
 
         customer = body.get('customer') or {}
 
@@ -205,16 +245,27 @@ class PaytrCallback(MethodView):
         PayTR server-to-server notification handler (Bildirim URL)
         """
         post = request.form
+        
+        # Log all incoming data for debugging
+        print("=== PAYTR CALLBACK RECEIVED ===")
+        print(f"All form data: {dict(post)}")
+        print(f"Headers: {dict(request.headers)}")
 
         merchant_key = os.getenv('PAYTR_MERCHANT_KEY', '')
         merchant_salt = os.getenv('PAYTR_MERCHANT_SALT', '')
         if not merchant_key or not merchant_salt:
+            print("ERROR: Missing PayTR credentials")
             return 'CONFIG ERROR', 500
 
         merchant_oid = post.get('merchant_oid', '')
         status = post.get('status', '')
         total_amount = post.get('total_amount', '')
         posted_hash = post.get('hash', '')
+        
+        print(f"merchant_oid: {merchant_oid}")
+        print(f"status: {status}")
+        print(f"total_amount: {total_amount}")
+        print(f"posted_hash: {posted_hash}")
 
         # Step 2 HMAC per PayTR sample: hash over merchant_oid + merchant_salt + status + total_amount
         hash_str = merchant_oid + merchant_salt + status + total_amount
@@ -225,14 +276,23 @@ class PaytrCallback(MethodView):
                 hashlib.sha256
             ).digest()
         ).decode('utf-8')
+        
+        print(f"hash_str: {hash_str}")
+        print(f"computed_hash: {computed_hash}")
+        print(f"posted_hash: {posted_hash}")
+        print(f"hash_match: {computed_hash == posted_hash}")
 
         if computed_hash != posted_hash:
+            print("ERROR: Hash mismatch!")
             return 'PAYTR notification failed: bad hash'
 
         supabase = _get_supabase_client()
         # Find order by merchant_oid
         order_res = supabase.table('orders').select('*').eq('merchant_oid', merchant_oid).limit(1).execute()
+        print(f"Order lookup result: {order_res.data}")
+        
         if not order_res.data:
+            print(f"WARNING: No order found for merchant_oid: {merchant_oid}")
             # No order found; still acknowledge to avoid retries storm but log via event
             try:
                 supabase.table('order_events').insert({
@@ -240,13 +300,16 @@ class PaytrCallback(MethodView):
                     'event_type': 'callback_received',
                     'event_data': {'merchant_oid': merchant_oid, 'status': status, 'note': 'Order not found'}
                 }).execute()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error inserting order event: {e}")
             return 'OK'
 
         order = order_res.data[0]
+        print(f"Found order: {order}")
+        
         # Idempotency: if already finalized, acknowledge
         if order.get('status') in ('paid', 'failed'):
+            print(f"Order already finalized with status: {order.get('status')}")
             return 'OK'
 
         update_data = {}
@@ -254,14 +317,18 @@ class PaytrCallback(MethodView):
             try:
                 update_data['status'] = 'paid'
                 update_data['total_amount_kurus'] = int(total_amount)
-            except Exception:
+                print(f"Updating order to paid with amount: {total_amount}")
+            except Exception as e:
+                print(f"Error parsing total_amount: {e}")
                 update_data['status'] = 'paid'
         else:
             update_data['status'] = 'failed'
             update_data['failed_reason_code'] = post.get('failed_reason_code')
             update_data['failed_reason_msg'] = post.get('failed_reason_msg')
+            print(f"Updating order to failed: {update_data}")
 
-        supabase.table('orders').update(update_data).eq('id', order['id']).execute()
+        update_result = supabase.table('orders').update(update_data).eq('id', order['id']).execute()
+        print(f"Update result: {update_result.data}")
 
         try:
             supabase.table('order_events').insert({
@@ -269,9 +336,11 @@ class PaytrCallback(MethodView):
                 'event_type': 'payment_success' if status == 'success' else 'payment_failed',
                 'event_data': { 'callback': {k: post.get(k) for k in post.keys()} }
             }).execute()
-        except Exception:
-            pass
+            print("Order event inserted successfully")
+        except Exception as e:
+            print(f"Error inserting order event: {e}")
 
+        print("=== CALLBACK PROCESSING COMPLETE ===")
         return 'OK'
 
 
