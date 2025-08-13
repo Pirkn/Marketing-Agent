@@ -21,6 +21,9 @@ import SignUp from "./pages/SignUp";
 import ForgotPassword from "./pages/ForgotPassword";
 import Homepage from "./pages/Homepage";
 import Onboarding from "./pages/Onboarding";
+import Payment from "./pages/Payment";
+import PaymentSuccess from "./pages/PaymentSuccess";
+import PaymentFail from "./pages/PaymentFail";
 import { useAuth } from "./contexts/AuthContext";
 import { Navigate } from "react-router-dom";
 
@@ -42,6 +45,9 @@ function App() {
                 {/* Public routes */}
                 <Route path="/" element={<RootRedirect />} />
                 <Route path="/onboarding" element={<Onboarding />} />
+                <Route path="/payment" element={<Payment />} />
+                <Route path="/payment/success" element={<PaymentSuccess />} />
+                <Route path="/payment/fail" element={<PaymentFail />} />
                 <Route path="/signin" element={<SignIn />} />
                 <Route path="/signup" element={<SignUp />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />

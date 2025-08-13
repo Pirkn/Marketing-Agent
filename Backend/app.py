@@ -59,6 +59,8 @@ def create_app():
     api.register_blueprint(reddit_blp)
     api.register_blueprint(leads_blp)
     api.register_blueprint(onboarding_blp)
+    from src.routes.payments import blp as payments_blp
+    api.register_blueprint(payments_blp)
 
     return app
 
